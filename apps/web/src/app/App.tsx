@@ -44,13 +44,21 @@ interface JobListResponse {
   jobs: Job[]
 }
 
+interface Credential {
+  application?: string
+  url?: string
+  username?: string
+  secret_hash?: string
+}
+
 interface ParsedRecord {
   id: string
   file_id: string
   record_type?: string
   line_number?: number
   content_text?: string
-  extracted_entities?: Record<string, string[]>
+  structured_data?: { stealer_category?: string; [k: string]: unknown }
+  extracted_entities?: { credentials?: Credential[] } & Record<string, string[] | Credential[] | undefined>
   created_at?: string
 }
 
@@ -470,6 +478,83 @@ function EntityChips({ entities }: { entities?: Record<string, string[]> }) {
   )
 }
 
+// ---------------------------------------------------------------- record categories
+//
+// stealer_category values come straight from
+// apps/worker/app/parsers/infostealer.py (_STEALER_FILENAMES / _STEALER_DIR_HINTS).
+// Records that don't match any of those fall back to "other" — plain text_line /
+// text_chunk / csv / json records, same generic rendering the table always had.
+
+const CATEGORY_META: Record<string, { label: string; icon: string }> = {
+  stealer_password: { label: 'Credentials', icon: '🔑' },
+  cookies: { label: 'Cookies', icon: '🍪' },
+  autofill: { label: 'Autofill', icon: '📝' },
+  system_info: { label: 'System Info', icon: '🖥️' },
+  domain_detects: { label: 'Domain Detects', icon: '🌐' },
+  installed_software: { label: 'Installed Software', icon: '📦' },
+  installed_browsers: { label: 'Installed Browsers', icon: '🧭' },
+  process_list: { label: 'Processes', icon: '⚙️' },
+  desktop_file: { label: 'Desktop Files', icon: '🗂️' },
+  other: { label: 'Other', icon: '📄' },
+}
+
+function categoryOf(r: ParsedRecord): string {
+  return r.structured_data?.stealer_category || 'other'
+}
+
+// Categories the worker only *tags* today (structured_data.stealer_category) without
+// splitting into named fields — they still render as content + generic IOC chips.
+// "stealer_password" is the one category with real structured fields (see
+// _stealer_credential_record in txt_parser.py), so it's the only one with a
+// dedicated column layout below.
+const UNSTRUCTURED_NOTE: Record<string, string> = {
+  cookies: 'Cookie files are tagged but not yet split into domain/name/value columns server-side — showing raw lines and extracted IOCs.',
+  autofill: 'Autofill files are tagged but not yet split into field/value pairs server-side — showing raw lines and extracted IOCs.',
+  system_info: 'This is one JSON object per file, but it currently has a .txt extension so the text parser processes it line-by-line instead of as JSON — showing raw lines for now.',
+  domain_detects: 'Tagged but not yet summarized into a service/count table — showing raw lines and extracted IOCs.',
+}
+
+function CredentialsTable({ credentials }: { credentials: Credential[] }) {
+  if (credentials.length === 0) {
+    return <div className="px-3 py-8 text-center text-sm text-slate-500">No credential blocks in this page of records.</div>
+  }
+  return (
+    <table className="w-full text-sm">
+      <thead className="sticky top-0 bg-[#10151f] text-left text-xs uppercase tracking-wide text-slate-500">
+        <tr>
+          <th className="px-3 py-2">Application</th>
+          <th className="px-3 py-2">Host / URL</th>
+          <th className="px-3 py-2">Username</th>
+          <th className="px-3 py-2">Password</th>
+        </tr>
+      </thead>
+      <tbody>
+        {credentials.map((c, i) => (
+          <tr key={i} className="border-t border-slate-800/70 align-top hover:bg-slate-800/20">
+            <td className="px-3 py-2">
+              <span className="rounded bg-slate-800 px-2 py-0.5 text-xs text-slate-300">{c.application || '—'}</span>
+            </td>
+            <td className="px-3 py-2 font-mono text-xs text-slate-400">{c.url || '—'}</td>
+            <td className="px-3 py-2 font-mono text-xs text-slate-300">{c.username || <span className="text-slate-600">—</span>}</td>
+           <td className="px-3 py-2">
+  {c.secret_hash ? (
+    <span className="inline-flex items-center gap-2 rounded-md border border-slate-700 bg-[#10151f] px-2 py-1 font-mono text-[11px] text-slate-400">
+      {/* ✅ UPDATED: Changed icon to a document/pencil, updated tooltip to reflect plaintext storage */}
+      <span title="Stored as plaintext (development mode only)">📝</span> 
+      {c.secret_hash}
+      <button onClick={() => copyText(c.secret_hash!)} className="text-slate-500 hover:text-emerald-300">⧉</button>
+    </span>
+  ) : (
+    <span className="text-slate-600">—</span>
+  )}
+</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 const PAGE_SIZE = 100
 
 function JobDetailPage() {
@@ -482,6 +567,7 @@ function JobDetailPage() {
   const [search, setSearch] = useState('')
   const [debounced, setDebounced] = useState('')
   const [page, setPage] = useState(1)
+  const [activeCategory, setActiveCategory] = useState<string | null>(null)
   const autoTriedRef = useRef(false)
 
   // Poll the job + its root file until the job reaches a terminal state.
@@ -547,6 +633,43 @@ function JobDetailPage() {
       return () => clearInterval(t)
     }
   }, [loadRecords, job])
+
+  // Group the currently-loaded page of records by stealer_category (or "other"),
+  // in a stable, useful-first order.
+  const groups = useMemo(() => {
+    const map = new Map<string, ParsedRecord[]>()
+    for (const r of records?.records ?? []) {
+      const cat = categoryOf(r)
+      if (!map.has(cat)) map.set(cat, [])
+      map.get(cat)!.push(r)
+    }
+    const order = Object.keys(CATEGORY_META)
+    return [...map.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+  }, [records])
+
+  // Default to the first category that actually has records once they load.
+  useEffect(() => {
+    if (groups.length === 0) return
+    if (!activeCategory || !groups.some(([cat]) => cat === activeCategory)) {
+      setActiveCategory(groups[0][0])
+    }
+  }, [groups, activeCategory])
+
+  const activeRecords = groups.find(([cat]) => cat === activeCategory)?.[1] ?? []
+  // Only the consolidated "stealer_credential" record holds real merged
+  // credentials. Per-line "text_line" records in the same stealer_password
+  // group also run the credential-block regex on their single line (it's the
+  // same generic entity extractor every line goes through) and can produce
+  // spurious one-field partial matches — e.g. a lone "Login: x" line yields
+  // {username: "x"} with no password. Excluding non-stealer_credential rows
+  // avoids surfacing those as fake extra rows.
+  const activeCredentials = useMemo(
+    () =>
+      activeRecords
+        .filter((r) => r.record_type === 'stealer_credential')
+        .flatMap((r) => r.extracted_entities?.credentials ?? []) as Credential[],
+    [activeRecords],
+  )
 
   const passwordRequired =
     rootFile?.processing_status?.toLowerCase() === 'password_required' ||
@@ -616,39 +739,76 @@ function JobDetailPage() {
         </div>
       </div>
 
+      {groups.length > 0 && (
+        <div className="mb-3 flex gap-1 overflow-x-auto rounded-lg border border-slate-700/50 bg-[#0d1119] p-1">
+          {groups.map(([cat, recs]) => {
+            const meta = CATEGORY_META[cat] || CATEGORY_META.other
+            const count = cat === 'stealer_password'
+              ? recs.filter((r) => r.record_type === 'stealer_credential').flatMap((r) => r.extracted_entities?.credentials ?? []).length
+              : recs.length
+            const isActive = cat === activeCategory
+            return (
+              <button
+                key={cat}
+                onClick={() => setActiveCategory(cat)}
+                className={`flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium ${
+                  isActive ? 'bg-emerald-500/15 text-emerald-300' : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-200'
+                }`}
+              >
+                <span>{meta.icon}</span>
+                <span>{meta.label}</span>
+                <span className={`rounded-full px-1.5 text-[10px] ${isActive ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-500'}`}>
+                  {count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {activeCategory && UNSTRUCTURED_NOTE[activeCategory] && (
+        <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          {UNSTRUCTURED_NOTE[activeCategory]}
+        </div>
+      )}
+
       <div className="overflow-hidden rounded-xl border border-slate-700/50 bg-[#0d1119]">
         <div className="max-h-[60vh] overflow-auto">
-          <table className="w-full text-sm">
-            <thead className="sticky top-0 bg-[#10151f] text-left text-xs uppercase tracking-wide text-slate-500">
-              <tr>
-                <th className="w-14 px-3 py-2">#</th>
-                <th className="px-3 py-2">Content</th>
-                <th className="w-56 px-3 py-2">Entities</th>
-                <th className="w-16 px-3 py-2"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {records?.records.map((r, i) => (
-                <tr key={r.id} className="border-t border-slate-800/70 align-top hover:bg-slate-800/20">
-                  <td className="px-3 py-2 font-mono text-xs text-slate-600">{(page - 1) * PAGE_SIZE + i + 1}</td>
-                  <td className="px-3 py-2">
-                    <code className="whitespace-pre-wrap break-all font-mono text-xs text-slate-300">{r.content_text}</code>
-                  </td>
-                  <td className="px-3 py-2"><EntityChips entities={r.extracted_entities} /></td>
-                  <td className="px-3 py-2 text-right">
-                    <button onClick={() => copyText(r.content_text ?? '')} className="text-xs text-slate-500 hover:text-emerald-300">copy</button>
-                  </td>
-                </tr>
-              ))}
-              {records && records.records.length === 0 && (
+          {activeCategory === 'stealer_password' ? (
+            <CredentialsTable credentials={activeCredentials} />
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-[#10151f] text-left text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <td colSpan={4} className="px-3 py-8 text-center text-sm text-slate-500">
-                    {job && !isTerminal(job.status) ? 'Parsing… records will appear here.' : 'No records match.'}
-                  </td>
+                  <th className="w-14 px-3 py-2">#</th>
+                  <th className="px-3 py-2">Content</th>
+                  <th className="w-56 px-3 py-2">Entities</th>
+                  <th className="w-16 px-3 py-2"></th>
                 </tr>
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {activeRecords.map((r, i) => (
+                  <tr key={r.id} className="border-t border-slate-800/70 align-top hover:bg-slate-800/20">
+                    <td className="px-3 py-2 font-mono text-xs text-slate-600">{(page - 1) * PAGE_SIZE + i + 1}</td>
+                    <td className="px-3 py-2">
+                      <code className="whitespace-pre-wrap break-all font-mono text-xs text-slate-300">{r.content_text}</code>
+                    </td>
+                    <td className="px-3 py-2"><EntityChips entities={r.extracted_entities as Record<string, string[]> | undefined} /></td>
+                    <td className="px-3 py-2 text-right">
+                      <button onClick={() => copyText(r.content_text ?? '')} className="text-xs text-slate-500 hover:text-emerald-300">copy</button>
+                    </td>
+                  </tr>
+                ))}
+                {records && activeRecords.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="px-3 py-8 text-center text-sm text-slate-500">
+                      {job && !isTerminal(job.status) ? 'Parsing… records will appear here.' : 'No records match.'}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 

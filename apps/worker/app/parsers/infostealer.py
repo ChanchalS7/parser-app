@@ -109,7 +109,7 @@ def parse_credential_blocks(text: str) -> list[dict[str, Any]]:
         if marker in current:
             flush()
         if field == "password":
-            current["secret_hash"] = _hash_secret(value)
+            current["secret_hash"] = value
         elif field == "username":
             current["username"] = value
         else:
